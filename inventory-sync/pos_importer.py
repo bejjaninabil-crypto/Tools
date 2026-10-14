@@ -23,14 +23,13 @@ ITEM_CODE_FIELD = os.environ.get("QBPOS_ITEM_CODE_FIELD", "ItemNumber")
 QBPOSXML_VERSION = "3.0"
 POS_REQUEST_LOCK = threading.Lock()
 DESCRIPTION_FIELDS = (
+    "Desc2",
     "Description",
     "ItemDescription",
     "ItemDesc",
     "SalesDesc",
-    "Desc1",
-    "Desc2",
-    "ItemDesc1",
     "ItemDesc2",
+    "ItemDesc1",
 )
 
 
@@ -119,16 +118,28 @@ def parse_pos_response(response_xml):
             )
         if not math.isfinite(quantity):
             raise RuntimeError(f"POS returned a non-finite quantity for item {sku!r}.")
-        description_parts = [
-            normalized_fields[name.casefold()]
-            for name in DESCRIPTION_FIELDS
-            if normalized_fields.get(name.casefold())
-        ]
-        description = "\n".join(dict.fromkeys(description_parts))
+        description = next(
+            (
+                normalized_fields[name.casefold()]
+                for name in DESCRIPTION_FIELDS
+                if normalized_fields.get(name.casefold())
+            ),
+            "",
+        )
+        web_price = _number(normalized_fields.get("webprice"))
+        if web_price is not None and not math.isfinite(web_price):
+            raise RuntimeError(f"POS returned a non-finite web price for item {sku!r}.")
         items[sku] = {
             "sku": sku,
             "quantity": quantity,
+            "name": normalized_fields.get("desc1", "").strip(),
             "description": description,
+            "price": web_price,
+            "departmentCode": normalized_fields.get("departmentcode", "").strip(),
+            "size": normalized_fields.get("size", "").strip(),
+            "attribute": normalized_fields.get("attribute", "").strip(),
+            "barcode": normalized_fields.get("upc", "").strip(),
+            "keywords": normalized_fields.get("keywords", "").strip(),
         }
 
     if missing_codes:
