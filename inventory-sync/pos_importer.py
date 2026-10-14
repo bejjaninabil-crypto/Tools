@@ -22,6 +22,16 @@ COM_PROGID = "QBPOSXMLRPLib.RequestProcessor"
 ITEM_CODE_FIELD = os.environ.get("QBPOS_ITEM_CODE_FIELD", "ItemNumber")
 QBPOSXML_VERSION = "3.0"
 POS_REQUEST_LOCK = threading.Lock()
+DESCRIPTION_FIELDS = (
+    "Description",
+    "ItemDescription",
+    "ItemDesc",
+    "SalesDesc",
+    "Desc1",
+    "Desc2",
+    "ItemDesc1",
+    "ItemDesc2",
+)
 
 
 def query_pos_response():
@@ -78,6 +88,7 @@ def parse_pos_response(response_xml):
             if element is not item and len(element) == 0:
                 fields[element.tag] = (element.text or "").strip()
 
+        normalized_fields = {name.casefold(): value for name, value in fields.items()}
         sku = fields.get(ITEM_CODE_FIELD, "").strip()
         if not sku:
             missing_codes += 1
@@ -108,7 +119,17 @@ def parse_pos_response(response_xml):
             )
         if not math.isfinite(quantity):
             raise RuntimeError(f"POS returned a non-finite quantity for item {sku!r}.")
-        items[sku] = {"sku": sku, "quantity": quantity}
+        description_parts = [
+            normalized_fields[name.casefold()]
+            for name in DESCRIPTION_FIELDS
+            if normalized_fields.get(name.casefold())
+        ]
+        description = "\n".join(dict.fromkeys(description_parts))
+        items[sku] = {
+            "sku": sku,
+            "quantity": quantity,
+            "description": description,
+        }
 
     if missing_codes:
         print(f"Skipped {missing_codes} item(s) missing {ITEM_CODE_FIELD}.")
