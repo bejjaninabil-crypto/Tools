@@ -5,8 +5,11 @@ import math
 import mimetypes
 import os
 import re
+import subprocess
 import sys
 import threading
+import base64
+import binascii
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,6 +25,12 @@ COM_PROGID = "QBPOSXMLRPLib.RequestProcessor"
 ITEM_CODE_FIELD = os.environ.get("QBPOS_ITEM_CODE_FIELD", "ItemNumber")
 QBPOSXML_VERSION = "3.0"
 POS_REQUEST_LOCK = threading.Lock()
+PUBLISH_LOCK = threading.Lock()
+LIVE_REPOSITORY_URL = "https://github.com/DaychouniehTools/Tools.git"
+LIVE_REPOSITORY = Path.home() / "Documents" / "GitHub" / "DaychouniehTools-Tools"
+MAX_PUBLISH_BODY_BYTES = 128 * 1024 * 1024
+MAX_IMAGE_BYTES = 24 * 1024 * 1024
+IMAGE_FILENAME_PATTERN = re.compile(r"[A-Za-z0-9_.-]+\.(?:jpe?g|png|webp|gif|avif)", re.I)
 DESCRIPTION_FIELDS = (
     "Desc2",
     "Description",
@@ -154,6 +163,149 @@ def _number(value):
         return None
 
 
+def _run_git(arguments, cwd=None, timeout=240):
+    environment = os.environ.copy()
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    environment["GCM_INTERACTIVE"] = "auto"
+    try:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=cwd,
+            env=environment,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError as error:
+        raise RuntimeError("Git was not found. Install GitHub Desktop and restart the POS importer.") from error
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"Git {' '.join(arguments)} timed out. Check the GitHub connection and try again.") from error
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        if arguments and arguments[0] in {"fetch", "push", "clone"}:
+            detail = (
+                "GitHub sign-in or network access was not available. Confirm GitHub Desktop is signed in "
+                "to an account that can write to DaychouniehTools/Tools, then retry."
+            )
+        raise RuntimeError(f"Git {' '.join(arguments[:2])} failed. {detail}".strip())
+    return result.stdout.strip()
+
+
+def _ensure_live_repository():
+    if not LIVE_REPOSITORY.exists():
+        LIVE_REPOSITORY.parent.mkdir(parents=True, exist_ok=True)
+        _run_git(
+            ["clone", "--single-branch", "--branch", "main", LIVE_REPOSITORY_URL, str(LIVE_REPOSITORY)],
+            timeout=300,
+        )
+    if not (LIVE_REPOSITORY / ".git").is_dir():
+        raise RuntimeError(
+            f"The publish folder {LIVE_REPOSITORY} already exists but is not a Git clone. "
+            "Rename or move that folder, then retry."
+        )
+
+    origin = _run_git(["remote", "get-url", "origin"], cwd=LIVE_REPOSITORY)
+    normalized_origin = origin.strip().removesuffix(".git").rstrip("/").casefold()
+    if normalized_origin not in {
+        "https://github.com/daychouniehtools/tools",
+        "git@github.com:daychouniehtools/tools",
+        "ssh://git@github.com/daychouniehtools/tools",
+    }:
+        raise RuntimeError(f"Safety stop: {LIVE_REPOSITORY} is not connected to the live DaychouniehTools/Tools repository.")
+
+    branch = _run_git(["branch", "--show-current"], cwd=LIVE_REPOSITORY)
+    if branch != "main":
+        raise RuntimeError(f"Safety stop: the live publish clone is on branch {branch!r}, not 'main'.")
+    if _run_git(["status", "--porcelain"], cwd=LIVE_REPOSITORY):
+        raise RuntimeError(
+            f"Safety stop: {LIVE_REPOSITORY} has uncommitted changes. Review or commit them in GitHub Desktop before syncing."
+        )
+
+    _run_git(["fetch", "origin", "main"], cwd=LIVE_REPOSITORY, timeout=300)
+    _run_git(["merge", "--ff-only", "origin/main"], cwd=LIVE_REPOSITORY)
+
+
+def publish_pos_catalog(payload):
+    products = payload.get("products")
+    images = payload.get("images", {})
+    if not isinstance(products, list) or not products or len(products) > 10000:
+        raise ValueError("The reviewed catalog is empty or has an invalid number of products.")
+    if not isinstance(images, dict) or len(images) > 1000:
+        raise ValueError("The new product picture list is invalid.")
+
+    seen_skus = set()
+    referenced_images = set()
+    for product in products:
+        if not isinstance(product, dict):
+            raise ValueError("The catalog contains an invalid product record.")
+        sku = str(product.get("sku") or "").strip()
+        if not sku or sku.casefold() in seen_skus:
+            raise ValueError("The catalog contains a missing or duplicate item code.")
+        seen_skus.add(sku.casefold())
+        for field in ("imagePath", "additionalImagePaths"):
+            paths = product.get(field, [])
+            if isinstance(paths, str):
+                paths = [paths]
+            if not isinstance(paths, list):
+                raise ValueError(f"The catalog has an invalid {field} value for item {sku}.")
+            for image_path in paths:
+                match = re.fullmatch(r"(?:\./)?images/([^/\\]+)", str(image_path or ""), re.I)
+                if match and IMAGE_FILENAME_PATTERN.fullmatch(match.group(1)):
+                    referenced_images.add(match.group(1))
+
+    decoded_images = {}
+    total_image_bytes = 0
+    for filename, encoded in images.items():
+        if not isinstance(filename, str) or not IMAGE_FILENAME_PATTERN.fullmatch(filename):
+            raise ValueError("A new product picture has an invalid filename.")
+        if filename not in referenced_images or not isinstance(encoded, str):
+            raise ValueError(f"Picture {filename!r} is not referenced by the reviewed catalog.")
+        try:
+            image_bytes = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise ValueError(f"New product picture {filename!r} could not be decoded.") from error
+        if not image_bytes or len(image_bytes) > MAX_IMAGE_BYTES:
+            raise ValueError(f"New product picture {filename!r} is empty or larger than 24 MB.")
+        total_image_bytes += len(image_bytes)
+        if total_image_bytes > 96 * 1024 * 1024:
+            raise ValueError("The new product pictures exceed the 96 MB publish limit.")
+        decoded_images[filename] = image_bytes
+
+    with PUBLISH_LOCK:
+        _ensure_live_repository()
+        catalog_path = LIVE_REPOSITORY / "catalog.js"
+        catalog_text = "window.NABIL_PRODUCTS = " + json.dumps(products, ensure_ascii=False, indent=2) + ";\n"
+        catalog_path.write_text(catalog_text, encoding="utf-8", newline="\n")
+        staged_paths = ["catalog.js"]
+        images_directory = LIVE_REPOSITORY / "images"
+        images_directory.mkdir(exist_ok=True)
+        for filename, image_bytes in decoded_images.items():
+            (images_directory / filename).write_bytes(image_bytes)
+            staged_paths.append(f"images/{filename}")
+
+        _run_git(["add", "--", *staged_paths], cwd=LIVE_REPOSITORY)
+        if not _run_git(["diff", "--cached", "--name-only"], cwd=LIVE_REPOSITORY):
+            return {"changed": False, "message": "The live catalog already matches the reviewed QuickBooks update."}
+
+        _run_git(
+            ["-c", "user.name=DaychouniehTools", "-c", "user.email=75885662+DaychouniehTools@users.noreply.github.com",
+             "commit", "-m", "Sync catalog from QuickBooks POS"],
+            cwd=LIVE_REPOSITORY,
+        )
+        commit = _run_git(["rev-parse", "--short", "HEAD"], cwd=LIVE_REPOSITORY)
+        _run_git(["push", "origin", "main"], cwd=LIVE_REPOSITORY, timeout=300)
+
+    return {
+        "changed": True,
+        "commit": commit,
+        "productCount": len(products),
+        "pictureCount": len(decoded_images),
+    }
+
+
 def discover_pos_fields():
     root = ET.fromstring(query_pos_response())
     first_item = next(root.iter("ItemInventoryRet"), None)
@@ -247,6 +399,38 @@ class ImporterHandler(BaseHTTPRequestHandler):
             self._send(404, "text/plain; charset=utf-8", "Not found.")
             return
         self._send(200, content_type, file_path.read_bytes())
+
+    def do_POST(self):
+        if not self._request_is_local() or self.headers.get("Origin") != f"http://{HOST}:{PORT}":
+            self._send(403, "application/json; charset=utf-8", json.dumps({"error": "Local access only."}))
+            return
+        if urlsplit(self.path).path != "/api/publish/catalog":
+            self._send(404, "application/json; charset=utf-8", json.dumps({"error": "Not found."}))
+            return
+        if self.headers.get_content_type() != "application/json":
+            self._send(415, "application/json; charset=utf-8", json.dumps({"error": "Expected a JSON publish request."}))
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self._send(400, "application/json; charset=utf-8", json.dumps({"error": "Invalid request size."}))
+            return
+        if content_length <= 0 or content_length > MAX_PUBLISH_BODY_BYTES:
+            self._send(413, "application/json; charset=utf-8", json.dumps({"error": "The publish request is empty or exceeds the 128 MB limit."}))
+            return
+        try:
+            payload = json.loads(self.rfile.read(content_length))
+            if not isinstance(payload, dict):
+                raise ValueError("The publish request is invalid.")
+            result = publish_pos_catalog(payload)
+        except ValueError as error:
+            self._send(400, "application/json; charset=utf-8", json.dumps({"error": str(error)}))
+            return
+        except Exception as error:
+            print(f"POS catalog publish failed: {error}")
+            self._send(502, "application/json; charset=utf-8", json.dumps({"error": str(error)}))
+            return
+        self._send(200, "application/json; charset=utf-8", json.dumps(result))
 
     def log_message(self, format_string, *args):
         print(f"127.0.0.1 - {format_string % args}")
