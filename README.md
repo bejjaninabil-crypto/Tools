@@ -4,7 +4,7 @@ Daychounieh Tools is a responsive product catalog with Arabic and English produc
 
 ## Website
 
-The current live shop is at `https://libanabil.github.io/C-Users-L_LT-Documents-Nabil/`. After the GitHub account and repository are renamed, the planned address is `https://daychouniehtools.github.io/Daychounieh-Tools/`. Open `index.html` to view the bundled catalog locally. The reviewed catalog has 1,692 items; the `images/` folder may contain extra files not used by the current catalog. Search matches names, item codes, categories, descriptions, and tags. Customers can click a product photo to see a larger image and its details.
+The current live shop is at `https://daychouniehtools.github.io/Tools/`, published from `DaychouniehTools/Tools` on its `main` branch. Open `index.html` to view the bundled catalog locally. The reviewed catalog has 1,692 items; the `images/` folder may contain extra files not used by the current catalog. Search matches names, item codes, categories, descriptions, and tags. Customers can click a product photo to see a larger image and its details.
 
 Generate and verify a new QR code after the GitHub Pages address changes. The homepage displays the shop contact number prominently; its number link starts a phone call, and the WhatsApp button opens a chat.
 
@@ -42,4 +42,4 @@ The public site, product names, prices, item codes, and photos are visible to vi
 
 ## GitHub Pages
 
-Keep `index.html`, `catalog.js`, `.nojekyll`, and the complete `images/` folder in the public repository. GitHub Pages serves the storefront. Import products locally, then publish the updated catalog and photos using GitHub Desktop. Do not add `admin-import.html` to the public repository.
+Keep `index.html`, `catalog.js`, `.nojekyll`, and the complete `images/` folder in `DaychouniehTools/Tools` on `main`. GitHub Pages serves the storefront from that repository. Import products locally, then review and publish the updated catalog and photos using GitHub Desktop. Changes pushed only to the `bejjaninabil-crypto/Tools` fork do not update the live website. Do not add `admin-import.html` to the public repository.
